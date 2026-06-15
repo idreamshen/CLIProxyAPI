@@ -64,16 +64,24 @@ func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
 	t.mu.Lock()
 
-	if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-		t.mu.Unlock()
-		return h2Conn, nil
+	if h2Conn, ok := t.connections[host]; ok {
+		if h2Conn.CanTakeNewRequest() {
+			t.mu.Unlock()
+			return h2Conn, nil
+		}
+		delete(t.connections, host)
+		_ = h2Conn.Close()
 	}
 
 	if cond, ok := t.pending[host]; ok {
 		cond.Wait()
-		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-			t.mu.Unlock()
-			return h2Conn, nil
+		if h2Conn, ok := t.connections[host]; ok {
+			if h2Conn.CanTakeNewRequest() {
+				t.mu.Unlock()
+				return h2Conn, nil
+			}
+			delete(t.connections, host)
+			_ = h2Conn.Close()
 		}
 	}
 
@@ -138,6 +146,7 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		t.mu.Lock()
 		if cached, ok := t.connections[hostname]; ok && cached == h2Conn {
 			delete(t.connections, hostname)
+			_ = h2Conn.Close()
 		}
 		t.mu.Unlock()
 		return nil, err

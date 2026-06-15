@@ -31,6 +31,45 @@ func (d staticAddressDialer) Dial(network, _ string) (net.Conn, error) {
 	return net.Dial(network, d.address)
 }
 
+type closeTrackingConn struct {
+	net.Conn
+	closeCount atomic.Int32
+}
+
+func (c *closeTrackingConn) Close() error {
+	c.closeCount.Add(1)
+	return c.Conn.Close()
+}
+
+type closeTrackingDialer struct {
+	address string
+	mu      sync.Mutex
+	conns   []*closeTrackingConn
+}
+
+func (d *closeTrackingDialer) Dial(network, _ string) (net.Conn, error) {
+	conn, err := net.Dial(network, d.address)
+	if err != nil {
+		return nil, err
+	}
+	tracked := &closeTrackingConn{Conn: conn}
+	d.mu.Lock()
+	d.conns = append(d.conns, tracked)
+	d.mu.Unlock()
+	return tracked, nil
+}
+
+func (d *closeTrackingDialer) firstConn(t *testing.T) *closeTrackingConn {
+	t.Helper()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.conns) == 0 {
+		t.Fatal("expected at least one tracked connection")
+	}
+	return d.conns[0]
+}
+
 func TestNewUtlsHTTPClientReusesCachedRoundTrippers(t *testing.T) {
 	resetUtlsRoundTripperCache(t)
 
@@ -124,18 +163,7 @@ func TestNewUtlsHTTPClientReusesSingleUtlsConnectionForConcurrentProtectedReques
 	server.StartTLS()
 	defer server.Close()
 
-	serverTLSConfig := server.Client().Transport.(*http.Transport).TLSClientConfig
-	serverHost, _, err := net.SplitHostPort(server.Listener.Addr().String())
-	if err != nil {
-		t.Fatalf("split server address: %v", err)
-	}
-	restoreTLSConfig := overrideUtlsTLSConfig(t, func(_ string) *tls.Config {
-		return &tls.Config{
-			ServerName: serverHost,
-			RootCAs:    serverTLSConfig.RootCAs,
-			NextProtos: []string{"h2"},
-		}
-	})
+	restoreTLSConfig := overrideUtlsTLSConfigForServer(t, server)
 	defer restoreTLSConfig()
 
 	utlsRT := &utlsRoundTripper{
@@ -192,6 +220,54 @@ func TestNewUtlsHTTPClientReusesSingleUtlsConnectionForConcurrentProtectedReques
 	}
 }
 
+func TestUtlsRoundTripperClosesConnectionAfterRoundTripError(t *testing.T) {
+	resetUtlsRoundTripperCache(t)
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	restoreTLSConfig := overrideUtlsTLSConfigForServer(t, server)
+	defer restoreTLSConfig()
+
+	dialer := &closeTrackingDialer{address: server.Listener.Addr().String()}
+	utlsRT := &utlsRoundTripper{
+		connections: make(map[string]*http2.ClientConn),
+		pending:     make(map[string]*sync.Cond),
+		dialer:      dialer,
+	}
+	utlsRoundTripperCache.mu.Lock()
+	utlsRoundTripperCache.items[""] = cachedUtlsRoundTripper{
+		utls:     utlsRT,
+		fallback: http.DefaultTransport,
+	}
+	utlsRoundTripperCache.mu.Unlock()
+
+	client := NewUtlsHTTPClient(context.Background(), nil, nil, 0)
+	resp, err := client.Get("https://api.anthropic.com/v1/messages")
+	if resp != nil && resp.Body != nil {
+		if errClose := resp.Body.Close(); errClose != nil {
+			t.Fatalf("response body close returned error: %v", errClose)
+		}
+	}
+	if err == nil {
+		t.Fatal("expected request error after server closes connection")
+	}
+
+	if got := dialer.firstConn(t).closeCount.Load(); got == 0 {
+		t.Fatal("expected failed uTLS connection to be closed")
+	}
+	utlsRT.mu.Lock()
+	cachedConnections := len(utlsRT.connections)
+	utlsRT.mu.Unlock()
+	if cachedConnections != 0 {
+		t.Fatalf("cached uTLS connections = %d, want 0", cachedConnections)
+	}
+}
+
 func TestNewUtlsHTTPClientDoesNotGrowCachePastLimit(t *testing.T) {
 	resetUtlsRoundTripperCache(t)
 
@@ -237,6 +313,23 @@ func overrideUtlsTLSConfig(t *testing.T, next func(string) *tls.Config) func() {
 	return func() {
 		newUtlsTLSConfig = previous
 	}
+}
+
+func overrideUtlsTLSConfigForServer(t *testing.T, server *httptest.Server) func() {
+	t.Helper()
+
+	serverTLSConfig := server.Client().Transport.(*http.Transport).TLSClientConfig
+	serverHost, _, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split server address: %v", err)
+	}
+	return overrideUtlsTLSConfig(t, func(_ string) *tls.Config {
+		return &tls.Config{
+			ServerName: serverHost,
+			RootCAs:    serverTLSConfig.RootCAs,
+			NextProtos: []string{"h2"},
+		}
+	})
 }
 
 func utlsClientRoundTrippers(t *testing.T, client *http.Client) (http.RoundTripper, http.RoundTripper) {
